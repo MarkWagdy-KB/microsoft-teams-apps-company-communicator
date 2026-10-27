@@ -575,6 +575,21 @@ function DeployARMTemplate {
                 }
                 [Console]::ResetColor()
             }
+
+            # The delete finishes in the background. Wait for it, or ARM fails with
+            # "conflicts with the pending 'Deleting repository' operation".
+            foreach ($appService in $appServicesNames) {
+                $configUri = "/subscriptions/$($parameters.subscriptionId.Value)/resourceGroups/$($parameters.resourceGroupName.Value)/providers/Microsoft.Web/sites/$appService/config/web?api-version=2022-03-01"
+                for ($try = 1; $try -le 20; $try++) {
+                    $scmType = az rest --method get --uri $configUri --query "properties.scmType" -o tsv 2>$null
+                    if ([string]::IsNullOrEmpty($scmType) -or $scmType -eq "None") { break }
+                    WriteI -message "Waiting for $appService source control link to be removed..."
+                    Start-Sleep -Seconds 15
+                }
+                [Console]::ResetColor()
+            }
+            Start-Sleep -Seconds 30
+        }
         }
 
         # Deploy ARM templates
