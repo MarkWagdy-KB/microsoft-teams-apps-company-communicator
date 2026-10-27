@@ -590,7 +590,6 @@ function DeployARMTemplate {
             }
             Start-Sleep -Seconds 30
         }
-        }
 
         # Deploy ARM templates
         WriteI -message "`nDeploying app services, Azure function, bot service, and other supporting resources... (this step can take over an hour)"
