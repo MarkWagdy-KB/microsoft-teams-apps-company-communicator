@@ -793,7 +793,9 @@ function ADAppUpdate {
     $azureDomainBase = $appdomainName
     $configAppUrl = "https://$azureDomainBase"
     $RedirectUris = ($configAppUrl + '/signin-simple-end')
-    $IdentifierUris = "api://$azureDomainBase"
+    # Teams SSO format. Including the app ID also satisfies the tenant policy that
+    # identifier URIs must contain a verified domain, the tenant ID or the app ID.
+    $IdentifierUris = "api://$azureDomainBase/$configAppId"
 
     # set subscription
     az account set --subscription $parameters.subscriptionId.Value
@@ -913,6 +915,7 @@ function GenerateAppManifestPackage {
         $mergeFields = @{
             '<<companyName>>'   = $parameters.companyName.Value 
             '<<botId>>'         = $appId
+            '<<graphAppId>>'    = $graphAppCred.appId
             '<<appDomain>>'     = $azureDomainBase
             '<<websiteUrl>>'    = $parameters.websiteUrl.Value
             '<<privacyUrl>>'    = $parameters.privacyUrl.Value

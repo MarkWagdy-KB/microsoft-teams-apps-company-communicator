@@ -642,7 +642,7 @@
             "AzureAd:TenantId": "[parameters('tenantId')]",
             "AzureAd:ClientId": "[parameters('graphAppId')]",
             "AzureAd:ClientSecret": "[concat('@Microsoft.KeyVault(SecretUri=', reference(variables('GraphAppSecretResourceId'),'2015-06-01').secretUriWithVersion, ')')]",
-            "AzureAd:ApplicationIdURI": "[if(variables('useFrontDoor'), concat('api://', reference(variables('frontDoorEndpointId'), '2023-05-01').hostName), '')]",
+            "AzureAd:ApplicationIdURI": "[if(variables('useFrontDoor'), concat('api://', reference(variables('frontDoorEndpointId'), '2023-05-01').hostName, '/', parameters('graphAppId')), '')]",
             "MicrosoftAppTenantId": "[parameters('tenantId')]",
             "UserAppId": "[parameters('userClientId')]",
             "UserAppPassword": "[concat('@Microsoft.KeyVault(SecretUri=', reference(variables('UserAppSecretResourceId'),'2015-06-01').secretUriWithVersion, ')')]",
