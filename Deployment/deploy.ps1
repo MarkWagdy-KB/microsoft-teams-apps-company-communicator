@@ -900,6 +900,17 @@ function GenerateAppManifestPackage {
         WriteS -message "Package has been created under this path $(Resolve-Path $destinationZipPath)"
 }
 
+# Front Door Standard adds a random part to its hostname, so read the real one from Azure.
+function GetFrontDoorHostName {
+    $name = $parameters.BaseResourceName.Value
+    $hostName = az afd endpoint show --resource-group $parameters.resourceGroupName.Value --subscription $parameters.subscriptionId.Value --profile-name $name --endpoint-name $name --query hostName -o tsv
+    if ([string]::IsNullOrWhiteSpace($hostName)) {
+        WriteW -message "Could not read the Front Door hostname. Find it in the Azure portal (Front Door profile '$name' > Endpoints) and use it in the manifests."
+        return "$($name.ToLower()).azurefd.net"
+    }
+    return $hostName.Trim()
+}
+
 function logout {
     $logOut = az logout
     $disAzAcc = Disconnect-AzAccount
@@ -1092,12 +1103,12 @@ if ($azureCLIVersion)
 
         # Reading the deployment output.
         WriteI -message "Reading deployment outputs..."
-        if(($null -eq $deploymentOutput) -or ( $null -eq $deploymentOutput.properties) -or ($null -eq $deploymentOutput.properties.Outputs) -or ($deploymentOutput.properties.Outputs.keyVaultName) -or ($deploymentOutput.properties.Outputs.keyVaultName.Value))
+        if(($null -eq $deploymentOutput) -or ( $null -eq $deploymentOutput.properties) -or ($null -eq $deploymentOutput.properties.Outputs) -or ([string]::IsNullOrEmpty($deploymentOutput.properties.Outputs.appDomain.Value)))
         {
             $keyVaultName = $parameters.BaseResourceName.Value + 'vault'
             if($parameters.customDomainOption.Value -eq 'Azure Front Door (recommended)')
             {
-               $appdomainName = $parameters.BaseResourceName.Value.ToLower() + '.azurefd.net'
+               $appdomainName = GetFrontDoorHostName
             }
             else
             {
@@ -1129,12 +1140,12 @@ if ($azureCLIVersion)
         
         # Reading the deployment output.
         WriteI -message "Reading deployment outputs..."
-        if(($null -eq $deploymentOutput) -or ( $null -eq $deploymentOutput.properties) -or ($null -eq $deploymentOutput.properties.Outputs) -or ($deploymentOutput.properties.Outputs.keyVaultName) -or ($deploymentOutput.properties.Outputs.keyVaultName.Value))
+        if(($null -eq $deploymentOutput) -or ( $null -eq $deploymentOutput.properties) -or ($null -eq $deploymentOutput.properties.Outputs) -or ([string]::IsNullOrEmpty($deploymentOutput.properties.Outputs.appDomain.Value)))
         {
             $keyVaultName = $parameters.BaseResourceName.Value + 'vault'
             if($parameters.customDomainOption.Value -eq 'Azure Front Door (recommended)')
             {
-               $appdomainName = $parameters.BaseResourceName.Value.ToLower() + '.azurefd.net'
+               $appdomainName = GetFrontDoorHostName
             }
             else
             {
