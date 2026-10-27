@@ -563,6 +563,19 @@ function DeployARMTemplate {
                 }
             }
         }
+        else {
+            # Re-run of a fresh install: an earlier run may have linked (or half-linked) the apps
+            # to GitHub. ARM cannot re-create an existing link ("Conflict with existing ScmType"),
+            # so clear it and let the ARM deployment link the repo and build again.
+            foreach ($appService in $appServicesNames) {
+                $siteExists = az webapp show --name $appService --resource-group $parameters.resourceGroupName.Value --subscription $parameters.subscriptionId.Value --query name -o tsv 2>$null
+                if ($siteExists) {
+                    WriteI -message "Clearing old source control link on $appService (if any)..."
+                    az webapp deployment source delete --name $appService --resource-group $parameters.resourceGroupName.Value --subscription $parameters.subscriptionId.Value 2>$null | Out-Null
+                }
+                [Console]::ResetColor()
+            }
+        }
 
         # Deploy ARM templates
         WriteI -message "`nDeploying app services, Azure function, bot service, and other supporting resources... (this step can take over an hour)"
