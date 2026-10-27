@@ -265,21 +265,79 @@ function IsResourceNameAvailable {
     select-object @{n = 'name'; e = { $name } }, @{n = 'type'; e = { $servicetype } }, @{n = 'available'; e = { $_ | select-object -expandproperty *available } }, reason, message
 }
 
-# To get the Azure AD app detail. 
-function GetAzureADApp {
-    param ($appName)
-    $app = az ad app list --filter "displayName eq '$appName'" | ConvertFrom-Json
-    return $app
+# ---------------------------------------------------------
+# Azure AD app helpers.
+# Uses Azure CLI 2.37+ (Microsoft Graph). The old AzureAD module and
+# Azure AD Graph are retired, so nothing here depends on them.
+# ---------------------------------------------------------
+
+# Runs an az command that returns JSON and converts it. Returns $null on empty output.
+# Plain function (no param block) so tokens like --id reach az unchanged.
+function AzJson {
+    $out = (& az @args) -join "`n"
+    if ([string]::IsNullOrWhiteSpace($out)) { return $null }
+    return ($out | ConvertFrom-Json)
 }
 
-# To get the Azure AD app detail with new secret. 
+# PATCHes an application object through Microsoft Graph.
+function GraphPatchApp {
+    param(
+        [Parameter(Mandatory = $true)] [string] $objectId,
+        [Parameter(Mandatory = $true)] $body
+    )
+    $tmp = [System.IO.Path]::GetTempFileName()
+    try {
+        # UTF-8 without BOM, so az can read it.
+        [System.IO.File]::WriteAllText($tmp, ($body | ConvertTo-Json -Depth 20 -Compress))
+        az rest --method PATCH --uri "https://graph.microsoft.com/v1.0/applications/$objectId" --headers "Content-Type=application/json" --body "@$tmp" | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Graph PATCH on application $objectId failed." }
+    }
+    finally {
+        Remove-Item $tmp -ErrorAction SilentlyContinue
+    }
+}
+
+# Full Graph application object (id = object id, appId = client id).
+function GetAppObject {
+    param([Parameter(Mandatory = $true)] [string] $appId)
+    return (AzJson ad app show --id $appId)
+}
+
+# Disables, then removes, every exposed API scope (and pre-authorized clients).
+function RemoveAppScopes {
+    param([Parameter(Mandatory = $true)] $appObject)
+    $scopes = @($appObject.api.oauth2PermissionScopes)
+    if ($scopes.Count -eq 0) { return }
+    foreach ($s in $scopes) { $s.isEnabled = $false }
+    GraphPatchApp $appObject.id @{ api = @{ preAuthorizedApplications = @(); oauth2PermissionScopes = $scopes } }
+    GraphPatchApp $appObject.id @{ api = @{ oauth2PermissionScopes = @() } }
+}
+
+# Makes sure the app has a service principal in this tenant (needed for admin consent).
+function EnsureServicePrincipal {
+    param([Parameter(Mandatory = $true)] [string] $appId)
+    az ad sp show --id $appId 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        az ad sp create --id $appId | Out-Null
+    }
+}
+
+# To get the Azure AD app detail.
+function GetAzureADApp {
+    param ($appName)
+    $list = AzJson ad app list --filter "displayName eq '$appName'"
+    foreach ($a in $list) { return $a }   # first match, or $null when none
+    return $null
+}
+
+# To get the Azure AD app detail with new secret.
 function GetAzureADAppWithSecret {
     param ($appName)
     $app = GetAzureADApp $appName
-    
-    #Reset the app credentials to get the secret. The default validity of this secret will be for 1 year from the date its created. 
+
+    #Reset the app credentials to get the secret. The default validity of this secret will be for 1 year from the date its created.
     WriteI -message "Retreiving new app with secrets..."
-    $appSecret = az ad app credential reset --id $app.appId --append | ConvertFrom-Json;
+    $appSecret = AzJson ad app credential reset --id $app.appId --append
 
     return $appSecret
 }
@@ -292,25 +350,29 @@ function CreateAzureADApp {
         [Parameter(Mandatory = $false)] [bool] $MultiTenant = $true,
         [Parameter(Mandatory = $false)] [bool] $AllowImplicitFlow
     )
-        
+
     try {
         WriteI -message "`r`nCreating Azure AD App: $appName..."
+
+        $audience = if ($MultiTenant) { "AzureADMultipleOrgs" } else { "AzureADMyOrg" }
+        $implicit = if ($AllowImplicitFlow) { "true" } else { "false" }
 
         # Check if the app already exists - script has been previously executed
         $app = GetAzureADApp $appName
 
-        if (-not ([string]::IsNullOrEmpty($app))) {
+        if ($null -ne $app) {
 
             # Update Azure AD app registration using CLI
             $confirmationTitle = "The Azure AD app '$appName' already exists. If you proceed, this will update the existing app configuration."
             $confirmationQuestion = "Do you want to proceed?"
             $confirmationChoices = "&Yes", "&No" # 0 = Yes, 1 = No
-            
+
             $updateDecision = $Host.UI.PromptForChoice($confirmationTitle, $confirmationQuestion, $confirmationChoices, 1)
             if ($updateDecision -eq 0) {
                 WriteI -message "Updating the existing app..."
 
-                az ad app update --id $app.appId --available-to-other-tenants $MultiTenant --oauth2-allow-implicit-flow $AllowImplicitFlow
+                az ad app update --id $app.appId --sign-in-audience $audience --enable-id-token-issuance $implicit --enable-access-token-issuance $implicit
+                if ($LASTEXITCODE -ne 0) { throw "az ad app update failed for $appName." }
 
                 WriteI -message "Waiting for app update to finish..."
 
@@ -323,7 +385,8 @@ function CreateAzureADApp {
             }
         } else {
             # Create Azure AD app registration using CLI
-             az ad app create --display-name $appName --available-to-other-tenants $MultiTenant --oauth2-allow-implicit-flow $AllowImplicitFlow
+            az ad app create --display-name $appName --sign-in-audience $audience --enable-id-token-issuance $implicit --enable-access-token-issuance $implicit | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "az ad app create failed for $appName." }
 
             WriteI -message "Waiting for app creation to finish..."
 
@@ -333,12 +396,16 @@ function CreateAzureADApp {
         }
 
         $app = GetAzureADApp $appName
-        
+        if ($null -eq $app) { throw "App $appName was not found after create/update." }
+
+        EnsureServicePrincipal $app.appId
+
         $appSecret = $null;
-        #Reset the app credentials to get the secret. The default validity of this secret will be for 1 year from the date its created. 
+        #Reset the app credentials to get the secret. The default validity of this secret will be for 1 year from the date its created.
         if ($ResetAppSecret) {
             WriteI -message "Updating app secret..."
-            $appSecret = az ad app credential reset --id $app.appId --append | ConvertFrom-Json;
+            $appSecret = AzJson ad app credential reset --id $app.appId --append
+            if ($null -eq $appSecret) { throw "Could not create a secret for $appName." }
         }
 
         WriteS -message "Azure AD App: $appName registered successfully."
@@ -520,10 +587,10 @@ function DeployARMTemplate {
                 if($appserviceCodeSyncSuccess){
                     WriteI -message "Re-running deployment to fetch output..."
                     if($parameters.useCertificate.Value){
-                        $armDeploymentResult = az deployment group create --resource-group $parameters.resourceGroupName.Value --subscription $parameters.subscriptionId.Value --template-file 'azuredeploywithcert.json' --parameters "baseResourceName=$($parameters.baseResourceName.Value)" "authorClientId=$authorappId" "authorAppCertName=$($parameters.authorAppCertName.Value)" "graphAppId=$graphappid" "graphAppCertName=$($parameters.graphAppCertName.Value)" "userClientId=$userappId" "userAppCertName=$($parameters.userAppCertName.Value)" "senderUPNList=$($parameters.senderUPNList.Value)" "REACT_APP_AUTHORIZED_USERS_EMAIL"= $($parameters.deleteAdminUPNList.Value)" "customDomainOption=$($parameters.customDomainOption.Value)" "appDisplayName=$($parameters.appDisplayName.Value)" "appDescription=$($parameters.appDescription.Value)" "appIconUrl=$($parameters.appIconUrl.Value)" "headerText=$($parameters.headerText.Value)" "headerLogoUrl=$($parameters.headerLogoUrl.Value)" "tenantId=$($parameters.tenantId.Value)" "hostingPlanSku=$($parameters.hostingPlanSku.Value)" "hostingPlanSize=$($parameters.hostingPlanSize.Value)" "location=$($parameters.region.Value)" "gitRepoUrl=$($parameters.gitRepoUrl.Value)" "gitBranch=$($parameters.gitBranch.Value)" "ProactivelyInstallUserApp=$($parameters.proactivelyInstallUserApp.Value)" "objectId=$($parameters.UserObjectId.Value)" "UserAppExternalId=$($parameters.userAppExternalId.Value)" "DefaultCulture=$($parameters.defaultCulture.Value)" "SupportedCultures=$($parameters.supportedCultures.Value)"  "serviceBusWebAppRoleNameGuid=$($parameters.serviceBusWebAppRoleNameGuid.Value)" "serviceBusPrepFuncRoleNameGuid=$($parameters.serviceBusPrepFuncRoleNameGuid.Value)" "serviceBusSendFuncRoleNameGuid=$($parameters.serviceBusSendFuncRoleNameGuid.Value)" "serviceBusDataFuncRoleNameGuid=$($parameters.serviceBusDataFuncRoleNameGuid.Value)" "storageAccountWebAppRoleNameGuid=$($parameters.storageAccountWebAppRoleNameGuid.Value)" "storageAccountPrepFuncRoleNameGuid=$($parameters.storageAccountPrepFuncRoleNameGuid.Value)" "storageAccountDataFuncRoleNameGuid=$($parameters.storageAccountDataFuncRoleNameGuid.Value)" 
+                        $armDeploymentResult = az deployment group create --resource-group $parameters.resourceGroupName.Value --subscription $parameters.subscriptionId.Value --template-file 'azuredeploywithcert.json' --parameters "baseResourceName=$($parameters.baseResourceName.Value)" "authorClientId=$authorappId" "authorAppCertName=$($parameters.authorAppCertName.Value)" "graphAppId=$graphappid" "graphAppCertName=$($parameters.graphAppCertName.Value)" "userClientId=$userappId" "userAppCertName=$($parameters.userAppCertName.Value)" "senderUPNList=$($parameters.senderUPNList.Value)" "deleteAdminUPNList=$($parameters.deleteAdminUPNList.Value)" "customDomainOption=$($parameters.customDomainOption.Value)" "appDisplayName=$($parameters.appDisplayName.Value)" "appDescription=$($parameters.appDescription.Value)" "appIconUrl=$($parameters.appIconUrl.Value)" "headerText=$($parameters.headerText.Value)" "headerLogoUrl=$($parameters.headerLogoUrl.Value)" "tenantId=$($parameters.tenantId.Value)" "hostingPlanSku=$($parameters.hostingPlanSku.Value)" "hostingPlanSize=$($parameters.hostingPlanSize.Value)" "location=$($parameters.region.Value)" "gitRepoUrl=$($parameters.gitRepoUrl.Value)" "gitBranch=$($parameters.gitBranch.Value)" "ProactivelyInstallUserApp=$($parameters.proactivelyInstallUserApp.Value)" "objectId=$($parameters.UserObjectId.Value)" "UserAppExternalId=$($parameters.userAppExternalId.Value)" "DefaultCulture=$($parameters.defaultCulture.Value)" "SupportedCultures=$($parameters.supportedCultures.Value)"  "serviceBusWebAppRoleNameGuid=$($parameters.serviceBusWebAppRoleNameGuid.Value)" "serviceBusPrepFuncRoleNameGuid=$($parameters.serviceBusPrepFuncRoleNameGuid.Value)" "serviceBusSendFuncRoleNameGuid=$($parameters.serviceBusSendFuncRoleNameGuid.Value)" "serviceBusDataFuncRoleNameGuid=$($parameters.serviceBusDataFuncRoleNameGuid.Value)" "storageAccountWebAppRoleNameGuid=$($parameters.storageAccountWebAppRoleNameGuid.Value)" "storageAccountPrepFuncRoleNameGuid=$($parameters.storageAccountPrepFuncRoleNameGuid.Value)" "storageAccountDataFuncRoleNameGuid=$($parameters.storageAccountDataFuncRoleNameGuid.Value)" 
                     }
                     else{
-                       $armDeploymentResult = az deployment group create --resource-group $parameters.resourceGroupName.Value --subscription $parameters.subscriptionId.Value --template-file 'azuredeploy.json' --parameters "baseResourceName=$($parameters.baseResourceName.Value)" "authorClientId=$authorappId" "authorClientSecret=$authorsecret" "graphAppId=$graphappid" "graphAppSecret=$graphappsecret" "userClientId=$userappId" "userClientSecret=$usersecret" "senderUPNList=$($parameters.senderUPNList.Value)" "customDomainOption=$($parameters.customDomainOption.Value)" "REACT_APP_AUTHORIZED_USERS_EMAIL"= $($parameters.deleteAdminUPNList.Value)" "appDisplayName=$($parameters.appDisplayName.Value)" "appDescription=$($parameters.appDescription.Value)" "appIconUrl=$($parameters.appIconUrl.Value)" "headerText=$($parameters.headerText.Value)" "headerLogoUrl=$($parameters.headerLogoUrl.Value)" "tenantId=$($parameters.tenantId.Value)" "hostingPlanSku=$($parameters.hostingPlanSku.Value)" "hostingPlanSize=$($parameters.hostingPlanSize.Value)" "location=$($parameters.region.Value)" "gitRepoUrl=$($parameters.gitRepoUrl.Value)" "gitBranch=$($parameters.gitBranch.Value)" "ProactivelyInstallUserApp=$($parameters.proactivelyInstallUserApp.Value)" "UserAppExternalId=$($parameters.userAppExternalId.Value)" "DefaultCulture=$($parameters.defaultCulture.Value)" "SupportedCultures=$($parameters.supportedCultures.Value)"  "serviceBusWebAppRoleNameGuid=$($parameters.serviceBusWebAppRoleNameGuid.Value)" "serviceBusPrepFuncRoleNameGuid=$($parameters.serviceBusPrepFuncRoleNameGuid.Value)" "serviceBusSendFuncRoleNameGuid=$($parameters.serviceBusSendFuncRoleNameGuid.Value)" "serviceBusDataFuncRoleNameGuid=$($parameters.serviceBusDataFuncRoleNameGuid.Value)" "storageAccountWebAppRoleNameGuid=$($parameters.storageAccountWebAppRoleNameGuid.Value)" "storageAccountPrepFuncRoleNameGuid=$($parameters.storageAccountPrepFuncRoleNameGuid.Value)" "storageAccountDataFuncRoleNameGuid=$($parameters.storageAccountDataFuncRoleNameGuid.Value)" 
+                       $armDeploymentResult = az deployment group create --resource-group $parameters.resourceGroupName.Value --subscription $parameters.subscriptionId.Value --template-file 'azuredeploy.json' --parameters "baseResourceName=$($parameters.baseResourceName.Value)" "authorClientId=$authorappId" "authorClientSecret=$authorsecret" "graphAppId=$graphappid" "graphAppSecret=$graphappsecret" "userClientId=$userappId" "userClientSecret=$usersecret" "senderUPNList=$($parameters.senderUPNList.Value)" "customDomainOption=$($parameters.customDomainOption.Value)" "deleteAdminUPNList=$($parameters.deleteAdminUPNList.Value)" "appDisplayName=$($parameters.appDisplayName.Value)" "appDescription=$($parameters.appDescription.Value)" "appIconUrl=$($parameters.appIconUrl.Value)" "headerText=$($parameters.headerText.Value)" "headerLogoUrl=$($parameters.headerLogoUrl.Value)" "tenantId=$($parameters.tenantId.Value)" "hostingPlanSku=$($parameters.hostingPlanSku.Value)" "hostingPlanSize=$($parameters.hostingPlanSize.Value)" "location=$($parameters.region.Value)" "gitRepoUrl=$($parameters.gitRepoUrl.Value)" "gitBranch=$($parameters.gitBranch.Value)" "ProactivelyInstallUserApp=$($parameters.proactivelyInstallUserApp.Value)" "UserAppExternalId=$($parameters.userAppExternalId.Value)" "DefaultCulture=$($parameters.defaultCulture.Value)" "SupportedCultures=$($parameters.supportedCultures.Value)"  "serviceBusWebAppRoleNameGuid=$($parameters.serviceBusWebAppRoleNameGuid.Value)" "serviceBusPrepFuncRoleNameGuid=$($parameters.serviceBusPrepFuncRoleNameGuid.Value)" "serviceBusSendFuncRoleNameGuid=$($parameters.serviceBusSendFuncRoleNameGuid.Value)" "serviceBusDataFuncRoleNameGuid=$($parameters.serviceBusDataFuncRoleNameGuid.Value)" "storageAccountWebAppRoleNameGuid=$($parameters.storageAccountWebAppRoleNameGuid.Value)" "storageAccountPrepFuncRoleNameGuid=$($parameters.storageAccountPrepFuncRoleNameGuid.Value)" "storageAccountDataFuncRoleNameGuid=$($parameters.storageAccountDataFuncRoleNameGuid.Value)" 
                     }
                 } else{
                     CollectARMDeploymentLogs
@@ -679,136 +746,72 @@ function GrantAdminConsent {
     }
 }
 
-# Azure AD app update. Assigning Admin-consent,RedirectUris,IdentifierUris,Optionalclaim etc. 
+# Azure AD app update. Assigning Admin-consent,RedirectUris,IdentifierUris,Optionalclaim etc.
 function ADAppUpdate {
     Param(
         [Parameter(Mandatory = $true)] $appdomainName,
         [Parameter(Mandatory = $true)] $appId
     )
-            $configAppId = $appId
-            $azureDomainBase = $appdomainName
-            $configAppUrl = "https://$azureDomainBase"
-            $RedirectUris = ($configAppUrl + '/signin-simple-end')
-            $IdentifierUris = "api://$azureDomainBase"
-            $appName = $parameters.baseResourceName.Value
+    $configAppId = $appId
+    $azureDomainBase = $appdomainName
+    $configAppUrl = "https://$azureDomainBase"
+    $RedirectUris = ($configAppUrl + '/signin-simple-end')
+    $IdentifierUris = "api://$azureDomainBase"
 
-    function CreatePreAuthorizedApplication(
-        [string] $applicationIdToPreAuthorize,
-        [string] $scopeId) {
-        $preAuthorizedApplication = New-Object 'Microsoft.Open.MSGraph.Model.PreAuthorizedApplication'
-        $preAuthorizedApplication.AppId = $applicationIdToPreAuthorize
-        $preAuthorizedApplication.DelegatedPermissionIds = @($scopeId)
-        return $preAuthorizedApplication
-    }
-
-    function CreateScope(
-        [string] $value,
-        [string] $userConsentDisplayName,
-        [string] $userConsentDescription,
-        [string] $adminConsentDisplayName,
-        [string] $adminConsentDescription) {
-        $scope = New-Object Microsoft.Open.MsGraph.Model.PermissionScope
-        $scope.Id = New-Guid
-        $scope.Value = $value
-        $scope.UserConsentDisplayName = $userConsentDisplayName
-        $scope.UserConsentDescription = $userConsentDescription
-        $scope.AdminConsentDisplayName = $adminConsentDisplayName
-        $scope.AdminConsentDescription = $adminConsentDescription
-        $scope.IsEnabled = $true
-        $scope.Type = "User"
-        return $scope
-    }
-
-    # Grant Admin consent
-    GrantAdminConsent $configAppId
-    
     # set subscription
     az account set --subscription $parameters.subscriptionId.Value
 
-    # Assigning graph permissions  
-    az ad app update --id $configAppId --required-resource-accesses './AadAppManifest.json'    
+    # Assigning graph permissions (must happen before consent)
+    az ad app update --id $configAppId --required-resource-accesses './AadAppManifest.json'
 
-    Import-Module AzureAD
+    # Grant Admin consent
+    GrantAdminConsent $configAppId
 
-
-    $apps = Get-AzureADApplication -Filter "DisplayName eq '$appName'"
-
-    if (0 -eq $apps.Length) {
-        $eachApp = New-AzureADApplication -DisplayName $appName
-    } else {
-        $eachApp = $apps[0]
-    }
-
-    $applicationObjectId = $eachApp.ObjectId
-
-    $app = Get-AzureADMSApplication -ObjectId $applicationObjectId
+    $app = GetAppObject $configAppId
 
     # Do nothing if the app has already been configured
-    if ($app.IdentifierUris.Count -gt 0) {
+    if (@($app.identifierUris).Count -gt 0) {
         WriteS -message "`Graph application is already configured."
         return
     }
     WriteI -message "`nUpdating graph app..."
 
-    #Removing default scope user_impersonation
-    $DEFAULT_SCOPE=$(az ad app show --id $configAppId | jq '.oauth2Permissions[0].isEnabled = false' | jq -r '.oauth2Permissions')
-    $DEFAULT_SCOPE>>scope.json
-    az ad app update --id $configAppId --set oauth2Permissions=@scope.json
-    Remove-Item .\scope.json
-    az ad app update --id $configAppId --remove oauth2Permissions
-    
-    #Re-assign app detail after removing default scope user_impersonation
-    $apps = Get-AzureADApplication -Filter "DisplayName eq '$appName'"
-
-    if (0 -eq $apps.Length) {
-        $eachApp = New-AzureADApplication -DisplayName $appName
-    } else {
-        $eachApp = $apps[0]
-    }
-
-    $applicationObjectId = $eachApp.ObjectId
-
-    $app = Get-AzureADMSApplication -ObjectId $applicationObjectId
+    # Removing any default scope (e.g. user_impersonation)
+    RemoveAppScopes $app
 
     # Expose an API
-    $appId = $app.AppId
-
     az ad app update --id $configAppId --identifier-uris $IdentifierUris
-    WriteI -message "App URI set"        
-            
-    $configApp = az ad app update --id $configAppId --reply-urls $RedirectUris
-    WriteI -message "App reply-urls set"  
-            
+    WriteI -message "App URI set"
+
+    az ad app update --id $configAppId --web-redirect-uris $RedirectUris
+    WriteI -message "App reply-urls set"
+
     az ad app update --id $configAppId --optional-claims './AadOptionalClaims.json'
     WriteI -message "App optionalclaim set."
-                    
+
     # Create access_as_user scope
-    # Add all existing scopes first
-    $scopes = New-Object System.Collections.Generic.List[Microsoft.Open.MsGraph.Model.PermissionScope]
-    $app.Api.Oauth2PermissionScopes | foreach-object { $scopes.Add($_) }
-    $scope = CreateScope -value "access_as_user"  `
-        -userConsentDisplayName "Access the API as the current logged-in user."  `
-        -userConsentDescription "Access the API as the current logged-in user."  `
-        -adminConsentDisplayName "Access the API as the current logged-in user."  `
-        -adminConsentDescription "Access the API as the current logged-in user."
-    $scopes.Add($scope)
-    $app.Api.Oauth2PermissionScopes = $scopes
-    Set-AzureADMSApplication -ObjectId $app.Id -Api $app.Api
+    $scopeId = [guid]::NewGuid().ToString()
+    $scopeText = "Access the API as the current logged-in user."
+    $scope = [ordered]@{
+        id                      = $scopeId
+        value                   = "access_as_user"
+        type                    = "User"
+        isEnabled               = $true
+        userConsentDisplayName  = $scopeText
+        userConsentDescription  = $scopeText
+        adminConsentDisplayName = $scopeText
+        adminConsentDescription = $scopeText
+    }
+    $app = GetAppObject $configAppId
+    GraphPatchApp $app.id @{ api = @{ oauth2PermissionScopes = @($scope) } }
     WriteI -message "Scope access_as_user added."
-             
+
     # Authorize Teams mobile/desktop client and Teams web client to access API
-    $preAuthorizedApplications = New-Object 'System.Collections.Generic.List[Microsoft.Open.MSGraph.Model.PreAuthorizedApplication]'
-    $teamsRichClientPreauthorization = CreatePreAuthorizedApplication `
-        -applicationIdToPreAuthorize '1fec8e78-bce4-4aaf-ab1b-5451cc387264' `
-        -scopeId $scope.Id
-    $teamsWebClientPreauthorization = CreatePreAuthorizedApplication `
-        -applicationIdToPreAuthorize '5e3ce6c0-2b1f-4285-8d4b-75ee78787346' `
-        -scopeId $scope.Id
-    $preAuthorizedApplications.Add($teamsRichClientPreauthorization)
-    $preAuthorizedApplications.Add($teamsWebClientPreauthorization)   
-    $app = Get-AzureADMSApplication -ObjectId $applicationObjectId
-    $app.Api.PreAuthorizedApplications = $preAuthorizedApplications
-    Set-AzureADMSApplication -ObjectId $app.Id -Api $app.Api
+    $preAuthorizedApplications = @(
+        @{ appId = '1fec8e78-bce4-4aaf-ab1b-5451cc387264'; delegatedPermissionIds = @($scopeId) },  # Teams desktop/mobile
+        @{ appId = '5e3ce6c0-2b1f-4285-8d4b-75ee78787346'; delegatedPermissionIds = @($scopeId) }   # Teams web
+    )
+    GraphPatchApp $app.id @{ api = @{ preAuthorizedApplications = $preAuthorizedApplications } }
     WriteI -message "Teams mobile/desktop and web clients applications pre-authorized."
 }
 
@@ -820,19 +823,7 @@ function ADAppUpdateDisplayName{
         [Parameter(Mandatory = $true)] $newName
     )
 
-    $apps = Get-AzureADApplication -Filter "DisplayName eq '$currentName'"
-
-    if (0 -eq $apps.Length) {
-        $app = New-AzureADApplication -DisplayName $currentName
-    } else {
-        $eachApp = $apps[0]
-    }
-
-    $applicationObjectId = $eachApp.ObjectId
-
-    $app = Get-AzureADMSApplication -ObjectId $applicationObjectId
-
-    az ad app update --id $appId --set DisplayName=$newName 	
+    az ad app update --id $appId --display-name $newName
 }
 
 # Removing existing access of app.
@@ -842,38 +833,23 @@ function FormatAADApp {
         [Parameter(Mandatory = $true)] $appName
     )
 
-    $apps = Get-AzureADApplication -Filter "DisplayName eq '$appName'"
-
-    if (0 -eq $apps.Length) {
-        $eachApp = New-AzureADApplication -DisplayName $appName
-    } else {
-        $eachApp = $apps[0]
-    }
-
-    $applicationObjectId = $eachApp.ObjectId
-
-    $app = Get-AzureADMSApplication -ObjectId $applicationObjectId
+    $app = GetAppObject $appId
 
     # Do nothing if the app has already been configured
-    if ($app.IdentifierUris.Count -eq 0) {
+    if (@($app.identifierUris).Count -eq 0) {
         WriteS -message "`n app already configured."
         return
     }
 
     WriteI -message "`nUpdating app..."
-    $IdentifierUris = "api://$appId"
 
-    $DEFAULT_SCOPE=$(az ad app show --id $appId | jq '.oauth2Permissions[0].isEnabled = false' | jq -r '.oauth2Permissions')
-    $DEFAULT_SCOPE>>scope.json
-    az ad app update --id $appId --set oauth2Permissions=@scope.json
-    Remove-Item .\scope.json
-    az ad app update --id $appId --remove oauth2Permissions
-    az ad app update --id $appId --set oauth2AllowIdTokenImplicitFlow=false
-    az ad app update --id $appId --remove replyUrls --remove IdentifierUris
-    az ad app update --id $appId --identifier-uris "$IdentifierUris"
-    az ad app update --id $appId --remove IdentifierUris
-    az ad app update --id $appId --optional-claims './AadOptionalClaims_Reset.json'
-    az ad app update --id $appId --remove requiredResourceAccess
+    RemoveAppScopes $app
+    GraphPatchApp $app.id @{
+        identifierUris         = @()
+        web                    = @{ redirectUris = @(); implicitGrantSettings = @{ enableIdTokenIssuance = $false } }
+        optionalClaims         = @{ idToken = @(); accessToken = @(); saml2Token = @() }
+        requiredResourceAccess = @()
+    }
 }
 #update manifest file and create a .zip file.
 function GenerateAppManifestPackage {
@@ -996,12 +972,7 @@ if ($azureCLIVersion)
         $isAvailable = $false
     }
 
-    if ((Get-Module -ListAvailable -Name "AzureAD")) {
-        WriteI -message "AzureAD module is available."
-    } else {
-        WriteW -message "AzureAD module is missing."
-        $isAvailable = $false
-    }
+    # The AzureAD module is retired and no longer needed: app registrations use Azure CLI (Microsoft Graph).
 
     if ((Get-Module -ListAvailable -Name "WriteAscii")) {
         WriteI -message "WriteAscii module is available."
@@ -1012,7 +983,7 @@ if ($azureCLIVersion)
 
     if (-not $isAvailable)
     {
-        $confirmationTitle = WriteI -message "The script requires the following modules to deploy: `n 1.Az module`n 2.AzureAD module `n 3.WriteAscii module`nIf you proceed, the script will install the missing modules."
+        $confirmationTitle = WriteI -message "The script requires the following modules to deploy: `n 1.Az module`n 2.WriteAscii module`nIf you proceed, the script will install the missing modules."
         $confirmationQuestion = "Do you want to proceed?"
         $confirmationChoices = "&Yes", "&No" # 0 = Yes, 1 = No
                 
@@ -1023,11 +994,6 @@ if ($azureCLIVersion)
                     Install-Module Az -AllowClobber -Scope CurrentUser
                 }
 
-                if (-not (Get-Module -ListAvailable -Name "AzureAD")) {
-                    WriteI -message"Installing AzureAD module..."
-                    Install-Module AzureAD -Scope CurrentUser -Force
-                }
-                
                 if (-not (Get-Module -ListAvailable -Name "WriteAscii")) {
                     WriteI -message "Installing WriteAscii module..."
                     Install-Module WriteAscii -Scope CurrentUser -Force
@@ -1064,8 +1030,6 @@ if ($azureCLIVersion)
         EXIT
     }
 
-    WriteI -message "Azure AD sign-in..."
-    $ADaccount = Connect-AzureAD -Tenant $parameters.subscriptionTenantId.Value -ErrorAction Stop
     $userAlias = (($user | ConvertFrom-Json) | where {$_.id -eq $parameters.subscriptionId.Value}).user.name
 
 # Validate the name of resources to be created.
@@ -1086,7 +1050,8 @@ if ($azureCLIVersion)
 	}
 	else
 	{
-		$userAppCred = CreateAzureADApp $usersApp
+		# Azure no longer allows multi-tenant bots, so the bot apps are single-tenant.
+		$userAppCred = CreateAzureADApp -AppName $usersApp -MultiTenant $False
 		if ($null -eq $userAppCred) {
 			WriteE -message "Failed to create or update User app in Azure Active Directory. Exiting..."
 			logout
@@ -1102,7 +1067,7 @@ if ($azureCLIVersion)
 	}
 	else
 	{
-		$authorAppCred = CreateAzureADApp $authorsApp
+		$authorAppCred = CreateAzureADApp -AppName $authorsApp -MultiTenant $False
 		if ($null -eq $authorAppCred) {
         WriteE -message "Failed to create or update the Author app in Azure Active Directory. Exiting..."
         logout

@@ -22,6 +22,7 @@ namespace Microsoft.Teams.Apps.CompanyCommunicator.Common.Services.CommonBot
     {
         private readonly Dictionary<string, ServiceClientCredentialsFactory> credentials;
         private readonly ICertificateProvider certificateProvider;
+        private readonly string tenantId;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="ConfigurationCredentialProvider"/> class.
@@ -35,11 +36,14 @@ namespace Microsoft.Teams.Apps.CompanyCommunicator.Common.Services.CommonBot
         {
             botOptions = botOptions ?? throw new ArgumentNullException(nameof(botOptions));
             this.credentials = new Dictionary<string, ServiceClientCredentialsFactory>();
+
+            // Bots are single-tenant, so tokens are requested from this tenant.
+            this.tenantId = botOptions.Value.TenantId ?? string.Empty;
             if (!string.IsNullOrEmpty(botOptions.Value.UserAppId))
             {
                 var appId = botOptions.Value.UserAppId;
                 var password = botOptions.Value.UserAppPassword;
-                var credFactory = new PasswordServiceClientCredentialFactory(appId, password, string.Empty, null, null);
+                var credFactory = new PasswordServiceClientCredentialFactory(appId, password, this.tenantId, null, null);
                 this.credentials.Add(appId, credFactory);
             }
 
@@ -47,7 +51,7 @@ namespace Microsoft.Teams.Apps.CompanyCommunicator.Common.Services.CommonBot
             {
                 var appId = botOptions.Value.AuthorAppId;
                 var password = botOptions.Value.AuthorAppPassword;
-                var credFactory = new PasswordServiceClientCredentialFactory(appId, password, string.Empty, null, null);
+                var credFactory = new PasswordServiceClientCredentialFactory(appId, password, this.tenantId, null, null);
                 this.credentials.Add(appId, credFactory);
             }
 
@@ -98,6 +102,7 @@ namespace Microsoft.Teams.Apps.CompanyCommunicator.Common.Services.CommonBot
                     AppId = appId,
                     ClientCertificate = cert,
                     OauthScope = null,
+                    ChannelAuthTenant = string.IsNullOrEmpty(this.tenantId) ? null : this.tenantId,
                 };
 
                 var certificateAppCredentials = new CertificateAppCredentials(options) as AppCredentials;

@@ -88,6 +88,8 @@ namespace Microsoft.Teams.Apps.CompanyCommunicator.Prep.Func
                         configuration.GetValue<string>("UserAppCertName", string.Empty);
                     botOptions.GraphAppCertName =
                         configuration.GetValue<string>("GraphAppCertName", string.Empty);
+                    botOptions.TenantId =
+                        configuration.GetValue<string>("MicrosoftAppTenantId") ?? configuration.GetValue<string>("TenantId") ?? configuration.GetValue<string>("AzureAd:TenantId");
                 });
             builder.Services.AddOptions<DataQueueMessageOptions>()
                 .Configure<IConfiguration>((dataQueueMessageOptions, configuration) =>

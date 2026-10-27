@@ -11,6 +11,12 @@ namespace Microsoft.Teams.Apps.CompanyCommunicator.Common.Services.CommonBot
     public class BotOptions
     {
         /// <summary>
+        /// Gets or sets the tenant ID the bot apps are registered in.
+        /// Bots are single-tenant, so tokens must come from this tenant.
+        /// </summary>
+        public string TenantId { get; set; }
+
+        /// <summary>
         /// Gets or sets the User app ID for the user bot.
         /// </summary>
         public string UserAppId { get; set; }

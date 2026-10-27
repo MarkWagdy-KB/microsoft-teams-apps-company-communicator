@@ -59,6 +59,8 @@ namespace Microsoft.Teams.Apps.CompanyCommunicator.Send.Func
                     botOptions.AuthorAppCertName = configuration.GetValue<string>("AuthorAppCertName", string.Empty);
                     botOptions.GraphAppId = configuration.GetValue<string>("GraphAppId");
                     botOptions.GraphAppCertName = configuration.GetValue<string>("GraphAppCertName", string.Empty);
+                    botOptions.TenantId =
+                        configuration.GetValue<string>("MicrosoftAppTenantId") ?? configuration.GetValue<string>("TenantId") ?? configuration.GetValue<string>("AzureAd:TenantId");
                     botOptions.UseCertificate = configuration.GetValue<bool>("UseCertificate", false);
                 });
             builder.Services.AddOptions<RepositoryOptions>()
