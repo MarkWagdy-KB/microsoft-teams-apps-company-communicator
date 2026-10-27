@@ -564,31 +564,41 @@ function DeployARMTemplate {
             }
         }
         else {
-            # Re-run of a fresh install: an earlier run may have linked (or half-linked) the apps
-            # to GitHub. ARM cannot re-create an existing link ("Conflict with existing ScmType"),
-            # so clear it and let the ARM deployment link the repo and build again.
+            # Re-run of a fresh install. ARM can't re-create an existing GitHub link, but that
+            # "Conflict with existing ScmType" error is tolerated further down as long as the
+            # code builds succeed. So keep links that already point at the right repo, and
+            # rebuild any app whose last build failed. Only links to another repo are removed.
             foreach ($appService in $appServicesNames) {
                 $siteExists = az webapp show --name $appService --resource-group $parameters.resourceGroupName.Value --subscription $parameters.subscriptionId.Value --query name -o tsv 2>$null
-                if ($siteExists) {
-                    WriteI -message "Clearing old source control link on $appService (if any)..."
-                    az webapp deployment source delete --name $appService --resource-group $parameters.resourceGroupName.Value --subscription $parameters.subscriptionId.Value 2>$null | Out-Null
-                }
                 [Console]::ResetColor()
-            }
+                if (-not $siteExists) { continue }
 
-            # The delete finishes in the background. Wait for it, or ARM fails with
-            # "conflicts with the pending 'Deleting repository' operation".
-            foreach ($appService in $appServicesNames) {
-                $configUri = "/subscriptions/$($parameters.subscriptionId.Value)/resourceGroups/$($parameters.resourceGroupName.Value)/providers/Microsoft.Web/sites/$appService/config/web?api-version=2022-03-01"
-                for ($try = 1; $try -le 20; $try++) {
-                    $scmType = az rest --method get --uri $configUri --query "properties.scmType" -o tsv 2>$null
-                    if ([string]::IsNullOrEmpty($scmType) -or $scmType -eq "None") { break }
-                    WriteI -message "Waiting for $appService source control link to be removed..."
-                    Start-Sleep -Seconds 15
-                }
+                $source = az webapp deployment source show --name $appService --resource-group $parameters.resourceGroupName.Value --subscription $parameters.subscriptionId.Value 2>$null | ConvertFrom-Json
                 [Console]::ResetColor()
+                if ($null -eq $source -or [string]::IsNullOrEmpty($source.repoUrl)) { continue }   # not linked: ARM will link it
+
+                if (($source.repoUrl -ne $parameters.gitRepoUrl.Value) -or ($source.branch -ne $parameters.gitBranch.Value)) {
+                    WriteI -message "Removing $appService link to $($source.repoUrl) ($($source.branch))..."
+                    az webapp deployment source delete --name $appService --resource-group $parameters.resourceGroupName.Value --subscription $parameters.subscriptionId.Value | Out-Null
+                    WriteW -message "Waiting 5 minutes for Azure to finish removing the old link..."
+                    Start-Sleep -Seconds 300
+                    continue
+                }
+
+                $deploymentsUri = "/subscriptions/$($parameters.subscriptionId.Value)/resourceGroups/$($parameters.resourceGroupName.Value)/providers/Microsoft.Web/sites/$appService/deployments?api-version=2019-08-01"
+                $last = (az rest --method get --uri $deploymentsUri | ConvertFrom-Json).value | Select-Object -First 1
+                if ($null -ne $last -and $last.properties.complete -and $last.properties.status -eq 3) {
+                    WriteI -message "Last build of $appService failed. Starting a new build..."
+                    $lastId = $last.name
+                    az webapp deployment source sync --name $appService --resource-group $parameters.resourceGroupName.Value --subscription $parameters.subscriptionId.Value | Out-Null
+                    # wait until the new build shows up, so the progress check doesn't read the old failed one
+                    for ($try = 1; $try -le 12; $try++) {
+                        Start-Sleep -Seconds 15
+                        $newest = (az rest --method get --uri $deploymentsUri | ConvertFrom-Json).value | Select-Object -First 1
+                        if ($null -ne $newest -and ($newest.name -ne $lastId -or -not $newest.properties.complete)) { break }
+                    }
+                }
             }
-            Start-Sleep -Seconds 30
         }
 
         # Deploy ARM templates
